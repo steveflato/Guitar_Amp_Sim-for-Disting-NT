@@ -1,7 +1,7 @@
-// Guitar Amp Sim - distingNT - v15
-// Mono in, stereo out with independent IR per channel
-// Input Gain + Drive (4 types) + IR L/R + Output Level
-// GUID: GtAm
+// Guitar Amp Sim - distingNT
+// Mono in, stereo out
+// Input Gain + Noise Gate + Drive + IR L/R + Stereo Width + Dry/Wet + Output Level
+// GUID: FLMP
 
 #include <distingnt/api.h>
 #include <distingnt/wav.h>
@@ -17,6 +17,16 @@
 static const int   kMaxIrLen = 128;
 static const char* kIrFolder = "CabIR";
 
+// DC blocker — proven stable
+struct DCBlock {
+    float x1, y1;
+    void init() { x1=y1=0.f; }
+    inline float process(float x, float R) {
+        float y = x - x1 + R*y1;
+        x1=x; y1=y; return y;
+    }
+};
+
 enum {
     kParamInput       = 0,
     kParamOutputL     = 1,
@@ -24,22 +34,20 @@ enum {
     kParamOutputR     = 3,
     kParamOutputRMode = 4,
     kParamInputGain   = 5,
-    kParamDriveType   = 6,
-    kParamDrive       = 7,
-    kParamOutputLevel = 8,
-    kParamIrSelectL   = 9,
-    kParamIrSelectR   = 10,
-};
-
-// DC blocker — simple difference equation, proven stable
-struct DCBlock {
-    float x1, y1;
-    void init() { x1=y1=0.f; }
-    // R close to 1 = very low cutoff (~5Hz removes DC only)
-    inline float process(float x, float R) {
-        float y = x - x1 + R*y1;
-        x1=x; y1=y; return y;
-    }
+    kParamBoost       = 6,   // clean pre-drive boost
+    kParamGate        = 7,
+    kParamCompThresh  = 8,   // compressor threshold
+    kParamCompRatio   = 9,   // compressor ratio
+    kParamCompRelease = 10,  // compressor release
+    kParamMakeup      = 11,  // compressor make-up gain
+    kParamDriveType   = 12,
+    kParamDrive       = 13,
+    kParamWidth       = 14,
+    kParamDryWet      = 15,
+    kParamOutputLevel = 16,
+    kParamIrSelectL   = 17,
+    kParamIrSelectR   = 18,
+    kParamLimiter     = 19,  // limiter ceiling dB (0=off)
 };
 
 struct _IrChannel {
@@ -63,8 +71,16 @@ struct _Alg : public _NT_algorithm {
     bool  cardMounted,   folderScanned;
     int   irFolderIndex, irSampleCount;
     float irNormGainL,   irNormGainR;
-    DCBlock dcBlock;        // removes DC from Hi-Z pickup
-    _NT_parameter params[11];
+    DCBlock dcBlock;
+    // Noise gate envelope follower state
+    float gateEnv;
+    // Peak hold for display (updated in step, read in draw)
+    float peakIn, peakOut;
+    // Compressor state
+    float compEnv;
+    float debugGainRed;
+    float limEnv;
+    _NT_parameter params[20];
 };
 
 static const char* kDriveTypeNames[] = {
@@ -76,27 +92,46 @@ static const _NT_parameter kDefaultParams[] = {
     NT_PARAMETER_AUDIO_OUTPUT_WITH_MODE("Output L", 1, 13)     // 1+2
     NT_PARAMETER_AUDIO_OUTPUT_WITH_MODE("Output R", 1, 14)     // 3+4
     { "Input Gain", -20, 40,  0, kNT_unitDb,      0, NULL },   // 5
-    { "Drive Type",   0,  3,  0, kNT_unitEnum,    0, kDriveTypeNames }, // 6
-    { "Drive",        0,100,  0, kNT_unitPercent,  0, NULL },   // 7
-    { "Out Level",  -20, 20,  0, kNT_unitDb,       0, NULL },   // 8
-    { "IR Left",      0,  0,  0, kNT_unitNone,     0, NULL },   // 9
-    { "IR Right",     0,  0,  0, kNT_unitNone,     0, NULL },   // 10
+    { "Boost",         0, 30,  0, kNT_unitDb,      0, NULL },   // 6  clean boost dB
+    { "Noise Gate",    0,100,  0, kNT_unitPercent,  0, NULL },   // 7
+    { "Comp Thresh", -80,  0,-40, kNT_unitDb,      0, NULL },   // 8
+    { "Comp Ratio",    1, 20,  4, kNT_unitNone,    0, NULL },   // 9  1=off, 20=limiting
+    { "Comp Release",  10,500,100, kNT_unitMs,      0, NULL },   // 10
+    { "Makeup Gain",   0, 40,  0, kNT_unitDb,      0, NULL },   // 11
+    { "Drive Type",    0,  3,  0, kNT_unitEnum,    0, kDriveTypeNames }, // 12
+    { "Drive",         0,100,  0, kNT_unitPercent,  0, NULL },   // 12
+    { "Width",         0,100,100,kNT_unitPercent,  0, NULL },    // 13
+    { "Dry/Wet",       0,100,100,kNT_unitPercent,  0, NULL },    // 14
+    { "Out Level",   -20, 20,  0, kNT_unitDb,       0, NULL },   // 15
+    { "IR Left",       0,  0,  0, kNT_unitNone,     0, NULL },   // 16
+    { "IR Right",      0,  0,  0, kNT_unitNone,     0, NULL },   // 17
+    { "Limiter",      -30,  0,  0, kNT_unitDb,        0, NULL },   // 19  0=off
 };
 
 static const uint8_t kPageIO[]  = { kParamInput,
                                     kParamOutputL, kParamOutputLMode,
                                     kParamOutputR, kParamOutputRMode };
-static const uint8_t kPageAmp[] = { kParamInputGain, kParamDriveType,
-                                    kParamDrive, kParamOutputLevel };
+static const uint8_t kPageAmp[] = { kParamInputGain, kParamBoost,
+                                    kParamGate,
+                                    kParamCompThresh, kParamCompRatio,
+                                    kParamCompRelease, kParamMakeup,
+                                    kParamDriveType, kParamDrive };
+static const uint8_t kPageMix[] = { kParamWidth, kParamDryWet, kParamOutputLevel };
 static const uint8_t kPageCab[] = { kParamIrSelectL, kParamIrSelectR };
+static const uint8_t kPageLim[] = { kParamLimiter };
 
 static const _NT_parameterPage kPages[] = {
     { "I/O", 5, 0, {0,0}, kPageIO  },
-    { "Amp", 4, 0, {0,0}, kPageAmp },
+    { "Amp", 9, 0, {0,0}, kPageAmp },
+    { "Mix", 3, 0, {0,0}, kPageMix },
     { "Cab", 2, 0, {0,0}, kPageCab },
+    { "Lim", 1, 0, {0,0}, kPageLim },
 };
-static const _NT_parameterPages kParamPages = { 3, kPages };
+static const _NT_parameterPages kParamPages = { 5, kPages };
 
+// ---------------------------------------------------------------------------
+//  IR loading
+// ---------------------------------------------------------------------------
 static float calcNorm(const float* buf, int len) {
     float peak = 0.f;
     for (int i = 0; i < len; i++) {
@@ -181,6 +216,9 @@ static void scanFolder(_Alg* p, int algIdx) {
     }
 }
 
+// ---------------------------------------------------------------------------
+//  API
+// ---------------------------------------------------------------------------
 static void calculateRequirements(_NT_algorithmRequirements& req, const int32_t*) {
     req.numParameters = ARRAY_SIZE(kDefaultParams);
     req.sram = sizeof(_Alg);
@@ -205,6 +243,11 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     alg->irSampleCount = 0;
     alg->irNormGainL = alg->irNormGainR = 1.f;
     alg->dcBlock.init();
+    alg->gateEnv = 0.f;
+    alg->compEnv = 0.f;
+    alg->debugGainRed = 1.f;
+    alg->limEnv = 0.f;
+    alg->peakIn = alg->peakOut = 0.f;
     return alg;
 }
 
@@ -229,6 +272,9 @@ static int parameterString(_NT_algorithm* self, int p, int v, char* buff) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+//  Saturation
+// ---------------------------------------------------------------------------
 static inline float saturate(float s, int type, float drive) {
     if (drive <= 0.f) return s;
     float pregain = 1.f + drive * 7.f;
@@ -255,6 +301,9 @@ static inline float saturate(float s, int type, float drive) {
     return sat / pregain;
 }
 
+// ---------------------------------------------------------------------------
+//  step
+// ---------------------------------------------------------------------------
 static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     _Alg* pThis = (_Alg*)self;
     int numFrames = numFramesBy4 * 4;
@@ -278,11 +327,47 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     bool replaceL = (pThis->v[kParamOutputLMode] != 0);
     bool replaceR = (pThis->v[kParamOutputRMode] != 0);
 
+    // Parameters computed once per block
+    float sr      = (float)NT_globals.sampleRate;
     float inGain  = powf(10.f, pThis->v[kParamInputGain]  / 20.f);
-    float dcR     = 1.f - 2.f*(float)M_PI*40.f/(float)NT_globals.sampleRate;
     float outGain = powf(10.f, pThis->v[kParamOutputLevel] / 20.f);
-    float drive   = pThis->v[kParamDrive] / 100.f;
+    float drive   = pThis->v[kParamDrive]   / 100.f;
+    float width   = pThis->v[kParamWidth]   / 100.f;   // 0=mono, 1=full stereo
+    float wet     = pThis->v[kParamDryWet]  / 100.f;   // 0=dry, 1=wet
+    float dry     = 1.f - wet;
     int   drvType = pThis->v[kParamDriveType];
+    float dcR     = 1.f - 2.f*(float)M_PI*40.f/sr;
+
+    // Noise gate: threshold from 0 (off) to 100 (-60dB to 0dB)
+    // Gate=0 means off, Gate=100 means very aggressive
+    // Boost: clean linear gain before comp/gate/drive
+    float boostGain = powf(10.f, pThis->v[kParamBoost] / 20.f);
+
+    // Compressor: peak detector with instant attack, variable release
+    float makeupGain    = powf(10.f, pThis->v[kParamMakeup] / 20.f);
+    float compThreshDb  = (float)pThis->v[kParamCompThresh];  // -80..0 dB
+    float compRatio     = (float)pThis->v[kParamCompRatio];
+    if (compRatio < 1.f) compRatio = 1.f;
+    int compRelMs       = pThis->v[kParamCompRelease];
+    if (compRelMs < 10) compRelMs = 100;
+    // Release coefficient: how fast envelope decays when signal drops
+    float compRelCoef   = expf(-1.f / (compRelMs * 0.001f * sr));
+    bool  useComp       = (compRatio > 1.f);
+
+    float gateThresh = 0.f;
+    float gateAttack = 0.f, gateRelease = 0.f;
+    bool  useGate = (pThis->v[kParamGate] > 0 && pThis->v[kParamInput] > 0);
+    if (useGate) {
+        float gateDb = -60.f + pThis->v[kParamGate] * 54.f / 100.f;
+        gateThresh  = powf(10.f, gateDb / 20.f);
+        gateAttack  = 1.f - expf(-1.f / (0.001f * sr));  // 1ms attack
+        gateRelease = 1.f - expf(-1.f / (0.050f * sr));  // 50ms release
+    }
+
+    // Limiter: 0=off, negative value = ceiling in dB
+    bool  limActive  = (pThis->v[kParamLimiter] < 0);
+    float limCeil    = limActive ? powf(10.f, pThis->v[kParamLimiter] / 20.f) : 1.f;
+    float limRelCoef = expf(-1.f / (0.050f * sr));  // 50ms release
 
     float* irL   = pThis->dram->L.irBuffer;
     float* dlL   = pThis->dram->L.delayLine;
@@ -294,6 +379,12 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     bool   hasIrL = pThis->irLoadedL && lenL > 0;
     bool   hasIrR = pThis->irLoadedR && lenR > 0;
 
+    float gateEnv = pThis->gateEnv;
+    float compEnv = pThis->compEnv;
+    float limEnv  = pThis->limEnv;
+    float peakIn  = pThis->peakIn  * 0.999f;  // slow decay for display
+    float peakOut = pThis->peakOut * 0.999f;
+
     float tmp[128];
     int done = 0;
     while (done < numFrames) {
@@ -302,51 +393,144 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         for (int i = 0; i < batch; i++) tmp[i] = in[done+i];
 
         for (int i = 0; i < batch; i++) {
-            float s = pThis->dcBlock.process(tmp[i] * inGain, dcR);
+            float raw = tmp[i] * inGain;
+
+            // DC block
+            float s = pThis->dcBlock.process(raw, dcR);
+
+            // Boost — clean pre-drive volume
+            s *= boostGain;
+
+            // Compressor: instant attack peak detector, variable release
+            if (useComp) {
+                float level = fabsf(s);
+                // Instant attack: envelope jumps up immediately
+                if (level > compEnv)
+                    compEnv = level;
+                else
+                    compEnv *= compRelCoef;  // slow release
+
+                // Gain reduction in dB domain
+                float envDb = (compEnv > 1e-6f)
+                    ? 20.f * log10f(compEnv) : -120.f;
+                float gainRedDb = 0.f;
+                if (envDb > compThreshDb)
+                    gainRedDb = (compThreshDb - envDb) * (1.f - 1.f/compRatio);
+                float gainRed = powf(10.f, gainRedDb / 20.f);
+                pThis->debugGainRed = gainRed;
+                s *= gainRed * makeupGain;
+            }
+
+            // Track pre-drive peak for display
+            float absS = fabsf(s);
+            if (absS > peakIn) peakIn = absS;
+
+            // Noise gate — envelope follower on input
+            float gateGain = 1.f;
+            if (useGate) {
+                if (absS > gateEnv)
+                    gateEnv += gateAttack  * (absS - gateEnv);
+                else
+                    gateEnv += gateRelease * (absS - gateEnv);
+                // Hard gate: open above threshold, closed below
+                gateGain = (gateEnv > gateThresh) ? 1.f : 0.f;
+            }
+            s *= gateGain;
+
+            // Saturation
             s = saturate(s, drvType, drive);
 
-            float convL = s;
+            // Left IR
+            float wetL = s;
             if (hasIrL) {
                 dlL[dposL] = s;
-                convL = 0.f;
+                wetL = 0.f;
                 int rpos = dposL;
                 for (int k = 0; k < lenL; k++) {
-                    convL += irL[k] * dlL[rpos];
+                    wetL += irL[k] * dlL[rpos];
                     if (--rpos < 0) rpos = lenL-1;
                 }
-                convL *= normL;
+                wetL *= normL;
                 if (++dposL >= lenL) dposL = 0;
             }
 
-            float convR = s;
+            // Right IR
+            float wetR = s;
             if (hasIrR) {
                 dlR[dposR] = s;
-                convR = 0.f;
+                wetR = 0.f;
                 int rpos = dposR;
                 for (int k = 0; k < lenR; k++) {
-                    convR += irR[k] * dlR[rpos];
+                    wetR += irR[k] * dlR[rpos];
                     if (--rpos < 0) rpos = lenR-1;
                 }
-                convR *= normR;
+                wetR *= normR;
                 if (++dposR >= lenR) dposR = 0;
             }
 
-            outL[done+i] = replaceL ? convL*outGain : outL[done+i] + convL*outGain;
-            outR[done+i] = replaceR ? convR*outGain : outR[done+i] + convR*outGain;
+            // Stereo width: blend L and R IR outputs
+            // width=1: full stereo (L=wetL, R=wetR)
+            // width=0: mono (L=R=mid)
+            float mid  = (wetL + wetR) * 0.5f;
+            float outWetL = mid + (wetL - mid) * width;
+            float outWetR = mid + (wetR - mid) * width;
+
+            // Dry/wet mix: dry = pre-IR signal (s), wet = IR output
+            float finalL = (dry * s + wet * outWetL) * outGain;
+            float finalR = (dry * s + wet * outWetR) * outGain;
+
+            // Track output peak for display
+            float absOut = fabsf(finalL);
+            if (absOut > peakOut) peakOut = absOut;
+
+            // Limiter — instant attack, fast release, applied to both channels
+            if (limActive) {
+                float peak = fabsf(finalL) > fabsf(finalR) ? fabsf(finalL) : fabsf(finalR);
+                if (peak > limEnv) limEnv = peak;
+                else limEnv *= limRelCoef;
+                if (limEnv > limCeil) {
+                    float limGain = limCeil / limEnv;
+                    finalL *= limGain;
+                    finalR *= limGain;
+                }
+            }
+
+            outL[done+i] = replaceL ? finalL : outL[done+i] + finalL;
+            outR[done+i] = replaceR ? finalR : outR[done+i] + finalR;
         }
         done += batch;
     }
+
     pThis->delayPosL = dposL;
     pThis->delayPosR = dposR;
+    pThis->gateEnv   = gateEnv;
+    pThis->compEnv   = compEnv;
+    pThis->limEnv    = limEnv;
+    pThis->peakIn    = peakIn;
+    pThis->peakOut   = peakOut;
 }
 
-// Draw a horizontal bar meter, left-aligned at (x,y), width w, height h
-// value 0..100, filled proportionally
+// ---------------------------------------------------------------------------
+//  draw
+// ---------------------------------------------------------------------------
 static void drawBar(int x, int y, int w, int h, int value, int col) {
-    NT_drawShapeI(kNT_box, x, y, x+w, y+h, 6);  // outline dim
+    NT_drawShapeI(kNT_box, x, y, x+w, y+h, 5);
     int fill = (value * (w-2)) / 100;
     if (fill > 0)
         NT_drawShapeI(kNT_rectangle, x+1, y+1, x+1+fill, y+h-1, col);
+}
+
+// Draw a peak meter bar (value 0.0-1.0 linear)
+static void drawMeter(int x, int y, int w, int h, float val) {
+    NT_drawShapeI(kNT_box, x, y, x+w, y+h, 5);
+    int fill = (int)(val * (w-2));
+    if (fill > w-2) fill = w-2;
+    if (fill > 0) {
+        // Green for low, yellow for mid, red for hot
+        int col = (fill < (w-2)*6/10) ? 10 :
+                  (fill < (w-2)*9/10) ? 14 : 12;
+        NT_drawShapeI(kNT_rectangle, x+1, y+1, x+1+fill, y+h-1, col);
+    }
 }
 
 static bool draw(_NT_algorithm* self) {
@@ -356,73 +540,114 @@ static bool draw(_NT_algorithm* self) {
     NT_drawShapeI(kNT_rectangle, 0, 0, 255, 10, 10);
     NT_drawText(128, 8, "Guitar Amp Sim", 15, kNT_textCentre, kNT_textNormal);
 
-    // --- Left column: Amp section ---
+    // --- Left section: Amp params ---
+    // Input gain
     NT_drawText(2, 19, "IN", 8, kNT_textLeft, kNT_textTiny);
-    NT_drawText(2, 27, "DRV", 8, kNT_textLeft, kNT_textTiny);
-    NT_drawText(2, 35, "OUT", 8, kNT_textLeft, kNT_textTiny);
-
-    // Input gain bar: -20..+40 range, map to 0..100
     int inVal = (int)((pThis->v[kParamInputGain] + 20) * 100 / 60);
-    if (inVal < 0) inVal = 0; if (inVal > 100) inVal = 100;
-    drawBar(18, 13, 80, 7, inVal, 12);
+    if (inVal<0) inVal=0; if (inVal>100) inVal=100;
+    drawBar(14, 12, 58, 6, inVal, 12);
 
-    // Drive bar: 0..100
-    drawBar(18, 21, 80, 7, pThis->v[kParamDrive], 11);
+    // Boost
+    NT_drawText(2, 26, "BS", 8, kNT_textLeft, kNT_textTiny);
+    int bsVal = (int)(pThis->v[kParamBoost] * 100 / 30);
+    drawBar(14, 19, 58, 6, bsVal, 13);
 
-    // Out level bar: -20..+20 range
-    int outVal = (int)((pThis->v[kParamOutputLevel] + 20) * 100 / 40);
-    if (outVal < 0) outVal = 0; if (outVal > 100) outVal = 100;
-    drawBar(18, 29, 80, 7, outVal, 12);
+    // Gate
+    NT_drawText(2, 33, "GT", 8, kNT_textLeft, kNT_textTiny);
+    drawBar(14, 26, 58, 6, pThis->v[kParamGate], pThis->v[kParamGate]>0 ? 10 : 5);
 
-    // Drive type label
-    static const char* driveNames[] = { "Soft", "Hard", "Fuzz", "Tape" };
+    // Comp — show threshold as bar, ratio as number
+    NT_drawText(2, 40, "CP", 8, kNT_textLeft, kNT_textTiny);
+    int cpVal = (int)((pThis->v[kParamCompThresh] + 40) * 100 / 40);
+    bool compActive = (pThis->compEnv > powf(10.f, pThis->v[kParamCompThresh]/20.f));
+    drawBar(14, 33, 42, 6, cpVal, compActive ? 14 : 8);
+    char ratBuf[4]; NT_intToString(ratBuf, pThis->v[kParamCompRatio]);
+    NT_drawText(58, 40, ratBuf, 9, kNT_textLeft, kNT_textTiny);
+
+    // Drive
+    NT_drawText(2, 47, "DR", 8, kNT_textLeft, kNT_textTiny);
+    drawBar(14, 40, 58, 6, pThis->v[kParamDrive], 11);
+
+    // Drive type + Width + Wet
+    static const char* dNames[] = { "Soft","Hard","Fuzz","Tape" };
     int dt = pThis->v[kParamDriveType];
-    if (dt >= 0 && dt <= 3)
-        NT_drawText(18, 43, driveNames[dt], 13, kNT_textLeft, kNT_textTiny);
+    NT_drawText(2, 54, (dt>=0&&dt<=3)?dNames[dt]:"", 9, kNT_textLeft, kNT_textTiny);
+    NT_drawText(32, 54, "W", 7, kNT_textLeft, kNT_textTiny);
+    drawBar(39, 47, 16, 6, pThis->v[kParamWidth], 9);
+    NT_drawText(57, 54, "M", 7, kNT_textLeft, kNT_textTiny);
+    drawBar(64, 47, 12, 6, pThis->v[kParamDryWet], 9);
 
     // --- Divider ---
-    NT_drawShapeI(kNT_line, 103, 11, 103, 63, 6);
+    NT_drawShapeI(kNT_line, 79, 11, 79, 63, 6);
 
-    // --- Right column: IR / status ---
-    NT_drawText(107, 19, "CAB", 8, kNT_textLeft, kNT_textTiny);
+    // --- Middle section: Level meters ---
+    // Debug: show actual v[] values and envelope states
+    char dbuf[32];
+    NT_drawText(83, 16, "GT:", 7, kNT_textLeft, kNT_textTiny);
+    NT_intToString(dbuf, pThis->v[kParamGate]);
+    NT_drawText(97, 16, dbuf, 9, kNT_textLeft, kNT_textTiny);
+
+    NT_drawText(83, 24, "CR:", 7, kNT_textLeft, kNT_textTiny);
+    NT_intToString(dbuf, pThis->v[kParamCompRatio]);
+    NT_drawText(97, 24, dbuf, 9, kNT_textLeft, kNT_textTiny);
+
+    NT_drawText(83, 32, "CT:", 7, kNT_textLeft, kNT_textTiny);
+    NT_intToString(dbuf, pThis->v[kParamCompThresh]);
+    NT_drawText(97, 32, dbuf, 9, kNT_textLeft, kNT_textTiny);
+
+    NT_drawText(83, 40, "CE:", 7, kNT_textLeft, kNT_textTiny);
+    NT_floatToString(dbuf, pThis->compEnv, 3);
+    NT_drawText(97, 40, dbuf, 9, kNT_textLeft, kNT_textTiny);
+
+    NT_drawText(83, 48, "GR:", 7, kNT_textLeft, kNT_textTiny);
+    NT_floatToString(dbuf, pThis->debugGainRed, 3);
+    NT_drawText(97, 48, dbuf, 9, kNT_textLeft, kNT_textTiny);
+
+    NT_drawText(83, 56, "PI:", 7, kNT_textLeft, kNT_textTiny);
+    NT_floatToString(dbuf, pThis->peakIn, 3);
+    NT_drawText(97, 56, dbuf, 9, kNT_textLeft, kNT_textTiny);
+
+    // --- Divider ---
+    NT_drawShapeI(kNT_line, 122, 11, 122, 63, 6);
+
+    // --- Right section: IR names ---
+    NT_drawText(125, 19, "CAB", 8, kNT_textLeft, kNT_textTiny);
 
     if (!pThis->cardMounted) {
-        NT_drawText(107, 30, "No SD card", 7, kNT_textLeft, kNT_textTiny);
+        NT_drawText(125, 30, "No SD", 7, kNT_textLeft, kNT_textTiny);
     } else if (pThis->irFolderIndex < 0) {
-        NT_drawText(107, 30, "No CabIR", 7, kNT_textLeft, kNT_textTiny);
-        NT_drawText(107, 38, "folder", 7, kNT_textLeft, kNT_textTiny);
+        NT_drawText(125, 30, "No CabIR", 7, kNT_textLeft, kNT_textTiny);
     } else if (pThis->awaitingLoadL || pThis->awaitingLoadR) {
-        NT_drawText(107, 30, "Loading...", 10, kNT_textLeft, kNT_textTiny);
+        NT_drawText(125, 30, "Loading...", 9, kNT_textLeft, kNT_textTiny);
     } else {
-        // Show L and R IR names (truncated to fit)
-        auto showIr = [&](int param, int y, const char* prefix) {
-            NT_drawText(107, y, prefix, 8, kNT_textLeft, kNT_textTiny);
+        auto showIr = [&](int param, int y, const char* prefix, bool loaded) {
+            NT_drawShapeI(kNT_rectangle, 125, y-4, 130, y+1,
+                          loaded ? 10 : 5);
+            NT_drawText(133, y, prefix, 8, kNT_textLeft, kNT_textTiny);
             int sel = pThis->v[param];
             if (sel >= 0 && sel < pThis->irSampleCount) {
                 _NT_wavInfo info;
                 NT_getSampleFileInfo((uint32_t)pThis->irFolderIndex,
                                      (uint32_t)sel, info);
                 if (info.name)
-                    NT_drawText(119, y, info.name, 12, kNT_textLeft, kNT_textTiny);
+                    NT_drawText(145, y, info.name, 11,
+                                kNT_textLeft, kNT_textTiny);
             }
         };
-        showIr(kParamIrSelectL, 27, "L:");
-        showIr(kParamIrSelectR, 35, "R:");
+        showIr(kParamIrSelectL, 27, "L", pThis->irLoadedL);
+        showIr(kParamIrSelectR, 37, "R", pThis->irLoadedR);
 
-        // IR loaded indicator dots
-        NT_drawShapeI(kNT_rectangle, 107, 43,
-                      pThis->irLoadedL ? 113 : 108, 48,
-                      pThis->irLoadedL ? 12 : 5);
-        NT_drawShapeI(kNT_rectangle, 116, 43,
-                      pThis->irLoadedR ? 122 : 117, 48,
-                      pThis->irLoadedR ? 12 : 5);
-        NT_drawText(107, 56, pThis->irLoadedL ? "L:OK" : "L:--", 8, kNT_textLeft, kNT_textTiny);
-        NT_drawText(125, 56, pThis->irLoadedR ? "R:OK" : "R:--", 8, kNT_textLeft, kNT_textTiny);
+        // Stereo width indicator
+        NT_drawText(125, 50, "W:", 7, kNT_textLeft, kNT_textTiny);
+        drawBar(135, 44, 30, 7, pThis->v[kParamWidth], 9);
     }
 
-    return true;  // true = we drew everything, don't show standard param line
+    return true;
 }
 
+// ---------------------------------------------------------------------------
+//  Factory
+// ---------------------------------------------------------------------------
 static const _NT_factory factory = {
     .guid = NT_MULTICHAR('F','L','M','P'),
     .name = "Guitar Amp Sim",
