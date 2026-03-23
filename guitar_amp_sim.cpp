@@ -424,7 +424,7 @@ static bool draw(_NT_algorithm* self) {
 }
 
 static const _NT_factory factory = {
-    .guid = NT_MULTICHAR('G','A','S','1'),
+    .guid = NT_MULTICHAR('F','L','M','P'),
     .name = "Guitar Amp Sim",
     .calculateRequirements = calculateRequirements,
     .construct = construct,
