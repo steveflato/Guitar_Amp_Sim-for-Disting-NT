@@ -48,6 +48,7 @@ enum {
     kParamIrSelectL   = 17,
     kParamIrSelectR   = 18,
     kParamLimiter     = 19,  // limiter ceiling dB (0=off)
+    kParamStereoDelay = 20,  // L-R delay 0..200 (units of 0.1ms)
 };
 
 struct _IrChannel {
@@ -55,9 +56,12 @@ struct _IrChannel {
     float delayLine[kMaxIrLen];
 };
 
+static const int kMaxDelayLen = 2048;  // ~20ms at 96kHz
+
 struct _GAS_DRAM {
     _IrChannel L;
     _IrChannel R;
+    float delayBuf[kMaxDelayLen];  // inter-channel delay buffer
 };
 
 struct _Alg : public _NT_algorithm {
@@ -80,7 +84,8 @@ struct _Alg : public _NT_algorithm {
     float compEnv;
     float debugGainRed;
     float limEnv;
-    _NT_parameter params[20];
+    int   delayWritePos;
+    _NT_parameter params[21];
 };
 
 static const char* kDriveTypeNames[] = {
@@ -106,6 +111,7 @@ static const _NT_parameter kDefaultParams[] = {
     { "IR Left",       0,  0,  0, kNT_unitNone,     0, NULL },   // 16
     { "IR Right",      0,  0,  0, kNT_unitNone,     0, NULL },   // 17
     { "Limiter",      -30,  0,  0, kNT_unitDb,        0, NULL },   // 19  0=off
+    { "L-R Delay",      0,200,  0, kNT_unitNone,      0, NULL },   // 20  0.1ms steps
 };
 
 static const uint8_t kPageIO[]  = { kParamInput,
@@ -118,14 +124,14 @@ static const uint8_t kPageAmp[] = { kParamInputGain, kParamBoost,
                                     kParamDriveType, kParamDrive };
 static const uint8_t kPageMix[] = { kParamWidth, kParamDryWet, kParamOutputLevel };
 static const uint8_t kPageCab[] = { kParamIrSelectL, kParamIrSelectR };
-static const uint8_t kPageLim[] = { kParamLimiter };
+static const uint8_t kPageLim[] = { kParamLimiter, kParamStereoDelay };
 
 static const _NT_parameterPage kPages[] = {
     { "I/O", 5, 0, {0,0}, kPageIO  },
     { "Amp", 9, 0, {0,0}, kPageAmp },
     { "Mix", 3, 0, {0,0}, kPageMix },
     { "Cab", 2, 0, {0,0}, kPageCab },
-    { "Lim", 1, 0, {0,0}, kPageLim },
+    { "Lim", 2, 0, {0,0}, kPageLim },
 };
 static const _NT_parameterPages kParamPages = { 5, kPages };
 
@@ -247,6 +253,8 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     alg->compEnv = 0.f;
     alg->debugGainRed = 1.f;
     alg->limEnv = 0.f;
+    alg->delayWritePos = 0;
+    memset(alg->dram->delayBuf, 0, sizeof(alg->dram->delayBuf));
     alg->peakIn = alg->peakOut = 0.f;
     return alg;
 }
@@ -364,6 +372,16 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         gateRelease = 1.f - expf(-1.f / (0.050f * sr));  // 50ms release
     }
 
+    // Inter-channel delay (Haas effect stereo widening)
+    // param in 0.1ms units, so 200 = 20ms
+    int delayTenths = pThis->v[kParamStereoDelay];
+    if (delayTenths < 0) delayTenths = 0;
+    // delay in samples = tenths_of_ms * sr / 10000
+    int delaySamples = (int)((float)delayTenths * sr / 10000.f);
+    if (delaySamples >= kMaxDelayLen) delaySamples = kMaxDelayLen - 1;
+    float* delayBuf = pThis->dram->delayBuf;
+    bool useDelay = (delaySamples > 0);
+
     // Limiter: 0=off, negative value = ceiling in dB
     bool  limActive  = (pThis->v[kParamLimiter] < 0);
     float limCeil    = limActive ? powf(10.f, pThis->v[kParamLimiter] / 20.f) : 1.f;
@@ -382,6 +400,7 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     float gateEnv = pThis->gateEnv;
     float compEnv = pThis->compEnv;
     float limEnv  = pThis->limEnv;
+    int   dwPos   = pThis->delayWritePos;
     float peakIn  = pThis->peakIn  * 0.999f;  // slow decay for display
     float peakOut = pThis->peakOut * 0.999f;
 
@@ -495,6 +514,17 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
                 }
             }
 
+            // Inter-channel delay: write L-delayed version into delay buffer,
+            // right channel reads from N samples ago
+            if (useDelay) {
+                delayBuf[dwPos] = finalL;
+                int readPos = dwPos - delaySamples;
+                if (readPos < 0) readPos += kMaxDelayLen;
+                finalR = delayBuf[readPos];  // R gets delayed copy of L
+                dwPos++;
+                if (dwPos >= kMaxDelayLen) dwPos = 0;
+            }
+
             outL[done+i] = replaceL ? finalL : outL[done+i] + finalL;
             outR[done+i] = replaceR ? finalR : outR[done+i] + finalR;
         }
@@ -506,6 +536,7 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     pThis->gateEnv   = gateEnv;
     pThis->compEnv   = compEnv;
     pThis->limEnv    = limEnv;
+    pThis->delayWritePos = dwPos;
     pThis->peakIn    = peakIn;
     pThis->peakOut   = peakOut;
 }
